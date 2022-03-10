@@ -1,0 +1,174 @@
+## STAA566 HW5 - Shiny App
+## date: March 9, 2022
+## created by: Suzanne Brenimer
+
+# Load libraries
+library(shiny)
+library(shinydashboard)
+library(shinyWidgets)
+library(tidyverse)
+library(ggplot2)
+library(reactable)
+library(lubridate)
+library(sf)
+library(plotly)
+library(viridis)
+
+# Load data
+# Load traffic incidents data from Denver website
+traf <- read.csv("https://www.denvergov.org/media/gis/DataCatalog/traffic_accidents/csv/traffic_accidents.csv")
+# for development/testing, faster to load from local copy
+# traf <- read.csv("data/traffic_accidents.csv")
+
+# Prepare geospatial data for Denver neighborhoods
+# Statistical neighborhoods data from Denver OpenData website, downloaded local copy
+dennb <- read_sf(dsn="data/statistical_neighborhoods.gdb",layer="statistical_neighborhoods")
+# Change geometries to work with plotly
+dennb <- st_cast(dennb, to="MULTIPOLYGON")
+
+# Load geospatial data for Denver roads
+# Street centerline data from Denver OpenData website, downloaded local copy
+denrd <- read_sf(dsn="data/street_centerline.gdb",layer="street_centerline")
+# Change geometries to work with plotly
+denrd <- st_cast(denrd, to="MULTILINESTRING") %>%
+  filter(VOLCLASS == "ARTERIAL" | VOLCLASS == "COLLECTOR")
+
+# Prepare data
+# columns to omit
+drop_colnums <- c(1:5,7:12,15:16,20:39,42:47)
+# columns to treat as factors
+factor_cols <- c("top_traffic_accident_offense","neighborhood_id")
+
+traf1 <- traf %>%
+  filter(neighborhood_id != "") %>%
+  mutate_if(is.character,str_trim) %>%
+  mutate(incident_yr = year(first_occurrence_date),
+         incident_mo = month(first_occurrence_date,label=TRUE),
+         incident_mY = as.Date(first_occurrence_date,format="%M-%Y"),
+         incident_date = date(first_occurrence_date),
+         incident_datetime = as_datetime(first_occurrence_date),
+         incident_hr = hour(incident_datetime),
+         incident_dow = wday(incident_date,label=TRUE,week_start=1)) %>%
+  mutate(across(factor_cols,as.factor)) %>%
+  select(-all_of(drop_colnums))
+
+# subset data manually
+traf3 <- traf1 %>%
+  filter(incident_date >= "2018-01-01")
+
+# define user choices
+nbhd_choices <- sort(as.character(unique(traf3$neighborhood_id)))
+
+
+## SHINY APP 
+ui <- dashboardPage(
+  skin="red",
+  dashboardHeader(
+    title = "Denver Traffic Incidents 2018-2022"
+  ),
+  dashboardSidebar(
+    pickerInput(inputId = "in_nbhds",
+                label = "Select neighborhoods:",
+                choices = nbhd_choices,
+                multiple=TRUE,
+                options = list(`actions-box` = TRUE),
+                selected = nbhd_choices
+    ),
+    menuItem("Table",tabName="inc_table"),
+    menuItem("Time Series by Neigbhorhood", tabName = "inc_nb"),
+    menuItem("Map of Incidents", tabName = "inc_map")
+  ),
+  dashboardBody(
+    tabItems(
+      tabItem("inc_table",
+              h2("Table of Data Selected"),
+              box(tableOutput("data_table"),width=500)
+      ),
+      tabItem("inc_nb",
+              h2("Incidents by Neighborhood: 2018-2022"),
+              box(plotlyOutput("p_timeseries_nb_nTot"),width=500)
+      ),
+      tabItem("inc_map",
+              h2("Map of Fatal Incidents with Selected Neighborhoods"),
+              box(plotlyOutput("p_map"), width= 500)
+      )
+    )
+  )
+)
+
+server <- function(input, output){
+  ## Input: Data
+  dataInput <- reactive({
+    in_nbhds <- input$in_nbhds
+    traf3 %>% 
+      filter(neighborhood_id %in% in_nbhds)
+  })
+  
+  
+  ## Output: Data
+  output$data_table <- renderTable({
+    dataInput()
+  })
+  
+  ## Output: Time Series
+  output$p_timeseries_nb_nTot <- renderPlotly({
+    # Plot time series BY NEIGHBORHOOD
+    in_nbhds <- reactive({input$in_nbhds})
+    
+    traf_plotdata <- dataInput() %>%
+      group_by(neighborhood_id,incident_date) %>%
+      summarise(nTotal = n(),
+                nFatal = sum(FATALITIES>0,na.rm=T),
+                .groups="keep") %>%
+      ungroup()
+    
+    # Total incidents BY NEIGHBORHOOD
+    p_timeseries_nTot_nb <- ggplot(data = traf_plotdata, aes(y=nTotal))+
+      geom_path(aes(x = incident_date, color=neighborhood_id)) +
+      labs(x = "Date",y = "Number of Incidents",
+           title = paste("Total Number of Incidents by Date and Neighborhood:",min(traf_plotdata$incident_date),"through",max(traf_plotdata$incident_date))) +
+      theme_bw()+
+      scale_x_continuous(breaks = unique(as.numeric(str_sub(traf_plotdata$incident_date,1,4))))
+    p_timeseries_nTot_nb <- ggplotly(p_timeseries_nTot_nb) %>% 
+      layout(xaxis = list(rangeslider = list(visible=T)))
+    p_timeseries_nTot_nb
+  })
+  
+  ## Output: Map
+  output$p_map <- renderPlotly({
+    in_nbhds <- reactive({input$in_nbhds})
+    
+    traf_sum_map <- dataInput() %>%
+      group_by(neighborhood_id) %>%
+      summarise(nTotal = n(),
+                nFatal = sum(FATALITIES>0,na.rm=T),
+                .groups="keep") %>%
+      ungroup()
+    
+    traf_inc_map <- dataInput() %>%
+      filter(FATALITIES > 0) %>%
+      mutate(FatalityNum = as.numeric(FATALITIES),
+             PedestrianInvolved = case_when(
+               pedestrian_ind > 0 ~ TRUE,
+               pedestrian_ind == 0 | is.na(pedestrian_ind) ~ FALSE
+             ))
+    
+    # Join incident and geospatial data by neighborhood
+    traf_plotdata_dennb <- left_join(dennb,traf_sum_map, by=c("NBHD_NAME" = "neighborhood_id"))
+    # Plot Denver neighborhoods and roads
+    p_map1 <- ggplot(data = traf_plotdata_dennb) +
+      geom_sf(aes(fill = nTotal, label= NBHD_NAME)) +
+      geom_sf(data = denrd, aes(label = FULLNAME), color="white", alpha=0.5) +
+      geom_point(data = traf_inc_map, aes(x=geo_lon,y=geo_lat, label=FatalityNum, color=PedestrianInvolved), alpha=0.80) +
+      scale_color_manual(values = c("orange","red")) +
+      theme_minimal() +
+      labs(title="Total Incidents by Neighborhood with Fatal Incident Locations",
+           x = "", y="", fill="Total Number of Accidents",
+           color="Pedestrian Involved")
+    p_map1 <- ggplotly(p_map1) %>% config(scrollZoom = TRUE)
+    p_map1
+  })
+}
+
+shinyApp(ui = ui, server = server)
+
